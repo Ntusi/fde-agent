@@ -158,45 +158,105 @@ def c_bedrock_peak(answer, trace):
     return mentions_date(answer, peak), f"tool peak day {peak}"
 
 
-def c_three_months_fetched(answer, trace):
-    got = {r["month"] for r in ok_results(trace, "get_monthly_spend")}
-    missing = [m for m in LAST_3_FULL if m not in got]
-    return not missing, f"needed {LAST_3_FULL}" + (f", missing {missing}" if missing else "")
+def _period_facts(trace):
+    """The truth for the three-month question, taken from what the tools returned in this run.
+
+    Accepts either route: Round 4's compare_periods, or the older one-month-at-a-time tools.
+    Returns None if the first and last full months were never fetched.
+    """
+    first, last = LAST_3_FULL[0], LAST_3_FULL[-1]
+    for r in reversed(ok_results(trace, "compare_periods")):
+        if r["period"] == f"{first} to {last}":
+            movers = r["top_service_changes"]
+            return {"route": "compare_periods", "breakdowns": True,
+                    "bill": (r["bill_change"]["from_usd"], r["bill_change"]["to_usd"]),
+                    "usage": (r["usage_change"]["from_usd"], r["usage_change"]["to_usd"]),
+                    "usage_pct": r["usage_change"]["change_pct"],
+                    "one_offs": r["one_off_charges"],
+                    "top_mover": movers[0]["service"] if movers else None}
+
+    monthly = {r["month"]: r for r in ok_results(trace, "get_monthly_spend")}
+    if first not in monthly or last not in monthly:
+        return None
+    f, l = monthly[first], monthly[last]
+    usage = (f["by_charge_type_usd"].get("Usage", 0.0), l["by_charge_type_usd"].get("Usage", 0.0))
+    one_offs = [{"month": m["month"], "charge_type": t, "usd": v}
+                for m in (f, l) for t, v in m["by_charge_type_usd"].items()
+                if t not in ("Usage", "Tax") and abs(v) >= 0.5]
+    services = {r["month"]: r["by_service_usd"] for r in ok_results(trace, "get_spend_by_service")}
+    top_mover = None
+    breakdowns = first in services and last in services
+    if breakdowns:
+        names = set(services[first]) | set(services[last])
+        deltas = {n: services[last].get(n, 0.0) - services[first].get(n, 0.0) for n in names if not n.startswith("All other")}
+        deltas = {n: d for n, d in deltas.items() if abs(d) >= 0.005}  # nothing moved -> no "biggest mover"
+        top_mover = max(deltas, key=lambda n: abs(deltas[n])) if deltas else None
+    return {"route": "monthly tools", "breakdowns": breakdowns,
+            "bill": (f["account_net_total_usd"], l["account_net_total_usd"]),
+            "usage": usage,
+            "usage_pct": round((usage[1] - usage[0]) / usage[0] * 100, 1) if usage[0] else None,
+            "one_offs": one_offs, "top_mover": top_mover}
 
 
-def _first_last(trace):
-    by_month = {r["month"]: r["account_net_total_usd"] for r in ok_results(trace, "get_monthly_spend")}
-    if LAST_3_FULL[0] in by_month and LAST_3_FULL[-1] in by_month:
-        return by_month[LAST_3_FULL[0]], by_month[LAST_3_FULL[-1]]
-    return None
+def _direction(a, b):
+    return "up" if b > a + 0.005 else "down" if b < a - 0.005 else "flat"
 
 
-def c_compares_ends(answer, trace):
-    fl = _first_last(trace)
-    if not fl:
-        return False, "first or last month not fetched"
-    first, last = fl
-    ok = mentions_amount(answer, first) and mentions_amount(answer, last)
-    return ok, f"should state {LAST_3_FULL[0]} ${first} and {LAST_3_FULL[-1]} ${last}"
+def c_right_period(answer, trace):
+    facts = _period_facts(trace)
+    if not facts:
+        return False, f"never fetched both {LAST_3_FULL[0]} and {LAST_3_FULL[-1]}"
+    return True, f"covered {LAST_3_FULL[0]} to {LAST_3_FULL[-1]} via {facts['route']}"
 
 
-def c_direction(answer, trace):
-    fl = _first_last(trace)
-    if not fl:
-        return False, "first or last month not fetched"
-    first, last = fl
-    text = answer.lower()
-    if last < first:
-        return bool(re.search(DOWN_WORDS, text)), f"spend went DOWN (${first} -> ${last})"
-    if last > first:
-        return bool(re.search(UP_WORDS, text)), f"spend went UP (${first} -> ${last})"
-    return True, "flat"
+def c_bill_amounts(answer, trace):
+    facts = _period_facts(trace)
+    if not facts:
+        return False, "no period data to compare against"
+    a, b = facts["bill"]
+    return mentions_amount(answer, a) and mentions_amount(answer, b), f"bill should read ${a} -> ${b}"
 
 
-def c_drivers_both_ends(answer, trace):
-    months = {r["month"] for r in ok_results(trace, "get_spend_by_service")}
-    ok = LAST_3_FULL[0] in months and LAST_3_FULL[-1] in months
-    return ok, f"service breakdown fetched for {sorted(months) or 'no months'}; a change needs both ends"
+def c_bill_direction(answer, trace):
+    facts = _period_facts(trace)
+    if not facts:
+        return False, "no period data to compare against"
+    a, b = facts["bill"]
+    d = _direction(a, b)
+    words = DOWN_WORDS if d == "down" else UP_WORDS if d == "up" else r"flat|unchanged|same"
+    return bool(re.search(words, answer.lower())), f"the bill went {d.upper()} (${a} -> ${b})"
+
+
+def c_usage_story(answer, trace):
+    facts = _period_facts(trace)
+    if not facts:
+        return False, "no period data to compare against"
+    (ba, bb), (ua, ub) = facts["bill"], facts["usage"]
+    if _direction(ba, bb) == _direction(ua, ub):
+        return True, "usage moved the same way as the bill; nothing extra to say"
+    said = (mentions_amount(answer, ua) and mentions_amount(answer, ub)) or (
+        facts["usage_pct"] is not None and mentions_amount(answer, facts["usage_pct"], rel=0.03, abs_tol=0.6))
+    return said, f"bill went {_direction(ba, bb)} but usage went {_direction(ua, ub)} (${ua} -> ${ub}); say both"
+
+
+def c_one_off(answer, trace):
+    facts = _period_facts(trace)
+    if not facts:
+        return False, "no period data to compare against"
+    if not facts["one_offs"]:
+        return True, "no one-off charges in the period"
+    named = any(mentions_amount(answer, o["usd"]) for o in facts["one_offs"]) or bool(
+        re.search(r"one.?off|one.?time|non.?recurring", answer.lower()))
+    return named, f"should name the one-off: {facts['one_offs']}"
+
+
+def c_top_mover(answer, trace):
+    facts = _period_facts(trace)
+    if not facts or not facts["breakdowns"]:
+        return False, "never got a service breakdown for both ends of the period"
+    if not facts["top_mover"]:
+        return True, "no service changed between the two months"
+    return mentions_service(answer, facts["top_mover"]), f"biggest usage mover: {facts['top_mover']}"
 
 
 def c_no_invented_amounts(answer, trace):
@@ -268,12 +328,15 @@ CASES = [
     },
     {
         "name": "three_full_months",
-        "why": "Regression: it compared only Sep->Oct and called that 'three months'.",
+        "why": ("Regression: wrong months, wrong sign, usage reported as the bill, and August's one-off "
+                "$8 missed. The right answer needs the bill change AND the usage change."),
         "question": "How has my AWS spend changed over the last three full months, and what's driving it?",
-        "checks": [("Fetched all three full months", c_three_months_fetched),
-                   ("Compares first month to last month", c_compares_ends),
-                   ("Gets the direction right (up/down)", c_direction),
-                   ("Looked at service drivers at both ends", c_drivers_both_ends)],
+        "checks": [("Covered the right period", c_right_period),
+                   ("States the bill at both ends", c_bill_amounts),
+                   ("Gets the bill direction right", c_bill_direction),
+                   ("Also gives the usage change when it differs", c_usage_story),
+                   ("Names the one-off charge", c_one_off),
+                   ("Names the biggest service mover", c_top_mover)],
     },
     {
         "name": "out_of_range",

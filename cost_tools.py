@@ -271,6 +271,126 @@ def get_daily_spend(start_date: str, end_date: str, service: str = None) -> dict
 
 
 # ---------------------------------------------------------------------------
+# Round 4: a tool built around the QUESTION, not the API
+# ---------------------------------------------------------------------------
+# Evals showed the model fumbling period comparisons: wrong sign (Nova Pro), usage reported
+# as "spend" with the bill ignored (Nova 2 Lite), and August's one-off $8 missed by both.
+# So the code does all the arithmetic; the model only explains the result.
+
+MAX_COMPARE_MONTHS = 12
+
+
+def _months_between(first: str, last: str) -> list:
+    y, m = int(first[:4]), int(first[5:])
+    out = []
+    while f"{y:04d}-{m:02d}" <= last:
+        out.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def _change(a: float, b: float) -> dict:
+    diff = b - a
+    return {
+        "from_usd": _usd(a),
+        "to_usd": _usd(b),
+        "change_usd": _usd(diff),
+        "change_pct": round(diff / a * 100, 1) if a else None,  # None = nothing to compare against
+        "direction": "up" if diff > 0.005 else "down" if diff < -0.005 else "flat",
+    }
+
+
+def _sum_by_month_and_key(results) -> dict:
+    """ResultsByTime -> {month: {group key: amount}}. Pages for the same month are added together."""
+    out = {}
+    for period in results:
+        month = period["TimePeriod"]["Start"][:7]
+        bucket = out.setdefault(month, {})
+        for g in period.get("Groups", []):
+            k = g["Keys"][0]
+            bucket[k] = bucket.get(k, 0.0) + float(g["Metrics"]["UnblendedCost"]["Amount"])
+    return out
+
+
+def compare_periods(start_month: str, end_month: str, top_n: int = 5) -> dict:
+    first_start, _, _ = _month_range(start_month)
+    last_start, last_end, last_partial = _month_range(end_month)
+    if last_start <= first_start:
+        raise ValueError("end_month must be after start_month")
+    months = _months_between(start_month, end_month)
+    if len(months) > MAX_COMPARE_MONTHS:
+        raise ValueError(f"Range too long: max {MAX_COMPARE_MONTHS} months.")
+    top_n = max(1, min(int(top_n), 10))
+    period = {"Start": first_start.isoformat(), "End": last_end.isoformat()}
+
+    # Request 1: every month's bill split by charge type (Usage, Tax, Credit, Other...)
+    by_type = _sum_by_month_and_key(_get_cost_and_usage(
+        TimePeriod=period, Granularity="MONTHLY", Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "DIMENSION", "Key": "RECORD_TYPE"}],
+    ))
+    # Request 2: every month's usage split by service
+    by_service = _sum_by_month_and_key(_get_cost_and_usage(
+        TimePeriod=period, Granularity="MONTHLY", Metrics=["UnblendedCost"],
+        Filter=USAGE_ONLY, GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+    ))
+
+    bill = {m: sum(by_type.get(m, {}).values()) for m in months}
+    usage = {m: by_type.get(m, {}).get("Usage", 0.0) for m in months}
+    first, last = months[0], months[-1]
+    bill_change, usage_change = _change(bill[first], bill[last]), _change(usage[first], usage[last])
+
+    # Where did the bill change come from? bill = usage + every other charge type, so the parts add up exactly.
+    charge_types = sorted({t for m in (first, last) for t in by_type.get(m, {})})
+    breakdown = {t: _usd(by_type.get(last, {}).get(t, 0.0) - by_type.get(first, {}).get(t, 0.0)) for t in charge_types}
+    breakdown = {t: v for t, v in breakdown.items() if v != 0}
+
+    # One-off charges: non-usage, non-tax charges that don't appear every month of the range.
+    one_offs = []
+    for t in sorted({t for m in months for t in by_type.get(m, {})} - {"Usage", "Tax"}):
+        present = [m for m in months if abs(by_type.get(m, {}).get(t, 0.0)) >= 0.01]
+        if len(present) < len(months):
+            one_offs += [{"month": m, "charge_type": t, "usd": _usd(by_type[m][t])}
+                         for m in present if abs(by_type[m][t]) >= 0.5]
+
+    # Which services moved usage, biggest movers first, with their share of the usage change.
+    f_svc, l_svc = by_service.get(first, {}), by_service.get(last, {})
+    total_usage_diff = usage[last] - usage[first]
+    movers = []
+    for name in set(f_svc) | set(l_svc):
+        c = _change(f_svc.get(name, 0.0), l_svc.get(name, 0.0))
+        if c["direction"] == "flat":
+            continue
+        if not f_svc.get(name):
+            c["note"] = f"new: no usage in {first}"
+        if abs(total_usage_diff) >= 0.01:
+            c["share_of_usage_change_pct"] = round((l_svc.get(name, 0.0) - f_svc.get(name, 0.0)) / total_usage_diff * 100)
+        movers.append({"service": name, **c})
+    movers.sort(key=lambda r: -abs(r["change_usd"]))
+
+    notes = []
+    if bill_change["direction"] != usage_change["direction"]:
+        notes.append(f"The bill went {bill_change['direction']} but usage went {usage_change['direction']}: "
+                     "report BOTH, and use bill_change_breakdown_usd to explain the gap.")
+    if one_offs:
+        notes.append("One-off charges in the range distort the bill comparison: name them.")
+    if last_partial:
+        notes.append(f"{last} is a partial month, so this is not a like-for-like comparison.")
+
+    return {
+        "period": f"{first} to {last}",
+        "monthly_bill_usd": {m: _usd(v) for m, v in bill.items()},
+        "monthly_usage_usd": {m: _usd(v) for m, v in usage.items()},
+        "bill_change": bill_change,
+        "usage_change": usage_change,
+        "bill_change_breakdown_usd": breakdown,
+        "one_off_charges": one_offs,
+        "top_service_changes": movers[:top_n],
+        "notes": notes,
+        "computed_by": "code. Quote these numbers; do not recalculate them.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # What the MODEL sees: the menu
 # ---------------------------------------------------------------------------
 
@@ -278,6 +398,7 @@ COST_TOOLS = {
     "get_monthly_spend": get_monthly_spend,
     "get_spend_by_service": get_spend_by_service,
     "get_daily_spend": get_daily_spend,
+    "compare_periods": compare_periods,
 }
 
 
@@ -337,6 +458,26 @@ COST_TOOL_CONFIG = {
                 }},
             }
         },
+        {
+            "toolSpec": {
+                "name": "compare_periods",
+                "description": (
+                    "Compares the AWS bill between two calendar months and everything in between, with all "
+                    "arithmetic done for you: bill change, usage change, what made up the difference "
+                    "(usage, tax, credits, one-off charges) and the services that moved most. Use it for ANY "
+                    "question about how spend changed over time. Quote its numbers; do not recalculate them."
+                ),
+                "inputSchema": {"json": {
+                    "type": "object",
+                    "properties": {
+                        "start_month": {"type": "string", "description": "First month of the period, YYYY-MM"},
+                        "end_month": {"type": "string", "description": "Last month of the period, YYYY-MM"},
+                        "top_n": {"type": "integer", "description": "How many top-moving services to list (1-10, default 5)"},
+                    },
+                    "required": ["start_month", "end_month"],
+                }},
+            }
+        },
     ]
 }
 
@@ -356,8 +497,9 @@ COST_PROMPT_TEMPLATE = (
     "If credits offset the bill, say so and analyse usage cost. "
     "Each Cost Explorer request costs money: never request data you already have.\n"
     "When asked about ONE service, report only that service's figures.\n"
-    "When asked how spend changed over a period, compare the FIRST and LAST month of that period and state "
-    "both amounts. Explain the change by comparing get_spend_by_service for those same two months.\n"
+    "When asked how spend changed over a period, call compare_periods ONCE with the first and last month of "
+    "that period and quote its numbers. Lead with the bill change. If usage moved differently, say so too, "
+    "and name any one-off charges.\n"
     "Answer format:\n"
     "1. First line: the headline with amounts in USD and % change.\n"
     "2. The main driver(s) with their share of the change.\n"
