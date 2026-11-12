@@ -152,8 +152,11 @@ def _resolve_service(service: str, start: dt.date, end_excl: dt.date):
 
     # 1. "contains" match, ignoring case: 'Bedrock' is inside 'Amazon Bedrock'
     contains = [n for n in names if service.lower() in n.lower()]
-    # 2. spelling match: 'Amazon Bedrok' is close to 'Amazon Bedrock'
-    close = difflib.get_close_matches(service, names, n=3, cutoff=0.6)
+    # 2. spelling match: 'Amazon Bedrok' is close to 'Amazon Bedrock'.
+    #    cutoff 0.8, not difflib's default 0.6: at 0.6 the shared 'Amazon ' prefix made
+    #    'Amazon Bedrock' look "close" to 'Amazon CloudFront' (eval run, 12 Nov). Typos score ~0.95.
+    lower = {n.lower(): n for n in names}
+    close = [lower[m] for m in difflib.get_close_matches(service.lower(), list(lower), n=3, cutoff=0.8)]
     candidates = list(dict.fromkeys(contains + close))  # merge, drop duplicates, keep order
 
     if len(candidates) == 1:
@@ -186,7 +189,10 @@ def get_monthly_spend(month: str) -> dict:
 
     return {
         "month": month,
-        "net_total_usd": _usd(sum(by_type.values())),
+        # Eval finding (12 Nov): asked about Bedrock, the model quoted THIS number (the whole bill)
+        # as Bedrock's spend, twice. A name that says what it covers is harder to misuse.
+        "scope": "whole account, all services",
+        "account_net_total_usd": _usd(sum(by_type.values())),
         "by_charge_type_usd": {k: _usd(v) for k, v in sorted(by_type.items(), key=lambda kv: -abs(kv[1]))},
         "partial_month": partial,
         "data_through": (end - dt.timedelta(days=1)).isoformat(),
@@ -253,6 +259,7 @@ def get_daily_spend(start_date: str, end_date: str, service: str = None) -> dict
     peak_day = max(days, key=days.get) if any(days.values()) else None
     result = {
         "service": service or "all services",
+        "scope": f"{service} only" if service else "whole account, all services",
         "daily_usd": days,
         "total_usd": _usd(sum(days.values())),
         "peak_day": peak_day,
@@ -284,8 +291,9 @@ COST_TOOL_CONFIG = {
             "toolSpec": {
                 "name": "get_monthly_spend",
                 "description": (
-                    "Net AWS bill for one calendar month from Cost Explorer, split by charge type "
-                    "(Usage, Credit, Tax, Refund...). Use it for 'how much did we spend' questions. "
+                    "Net AWS bill for the WHOLE ACCOUNT (all services) for one calendar month, split by "
+                    "charge type (Usage, Credit, Tax, Refund...). Use it for 'how much did we spend' questions. "
+                    "Never quote it as one service's spend. "
                     "partial_month=true means the month isn't over yet."
                 ),
                 "inputSchema": {"json": {"type": "object", "properties": {"month": _month_schema()}, "required": ["month"]}},
@@ -343,6 +351,9 @@ def cost_system_prompt() -> list:
         "month, say it's partial. "
         "If credits offset the bill, say so and analyse usage cost. "
         "Each Cost Explorer request costs money: never request data you already have.\n"
+        "When asked about ONE service, report only that service's figures.\n"
+        "When asked how spend changed over a period, compare the FIRST and LAST month of that period and state "
+        "both amounts. Explain the change by comparing get_spend_by_service for those same two months.\n"
         "Answer format:\n"
         "1. First line: the headline with amounts in USD and % change.\n"
         "2. The main driver(s) with their share of the change.\n"

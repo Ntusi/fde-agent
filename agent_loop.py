@@ -28,6 +28,7 @@ Run:
 import json
 import os
 import sys
+import time
 
 import boto3
 from botocore.exceptions import ClientError
@@ -56,19 +57,33 @@ def show(title, obj):
     print(json.dumps(obj, indent=2, default=str))
 
 
-def call_converse(client, **kwargs):
-    """Wraps converse() so common setup errors explain themselves."""
-    try:
-        response = client.converse(modelId=MODEL_ID, **kwargs)
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-        hints = {
-            "AccessDeniedException": "Model access not enabled in this region, or your IAM role lacks bedrock:InvokeModel.",
-            "ValidationException": "Usually a wrong model ID for this region, or a malformed message/tool structure.",
-            "ResourceNotFoundException": "Model ID doesn't exist in this region. Check the console.",
-            "ThrottlingException": "Too many requests. Wait a bit (we'll add proper retries in Step 6).",
-        }
-        sys.exit(f"\n{code}: {e.response['Error']['Message']}\nHint: {hints.get(code, 'See error above.')}")
+# Errors worth retrying: the request was fine, the service or model hiccuped.
+# (Retrying a ValidationException or AccessDenied is pointless: it fails the same way.)
+RETRYABLE = {"ThrottlingException", "ModelErrorException", "ServiceUnavailableException",
+             "InternalServerException", "ModelNotReadyException"}
+
+
+def call_converse(client, retries: int = 2, **kwargs):
+    """Wraps converse(): retries transient errors, and explains setup errors."""
+    for attempt in range(retries + 1):
+        try:
+            response = client.converse(modelId=MODEL_ID, **kwargs)
+            break
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in RETRYABLE and attempt < retries:
+                wait = 2 ** attempt  # exponential backoff: 1s, 2s, 4s...
+                print(f"  {code}: retrying in {wait}s (attempt {attempt + 2} of {retries + 1})")
+                time.sleep(wait)
+                continue
+            hints = {
+                "AccessDeniedException": "Model access not enabled in this region, or your IAM role lacks bedrock:InvokeModel.",
+                "ValidationException": "Usually a wrong model ID for this region, or a malformed message/tool structure.",
+                "ResourceNotFoundException": "Model ID doesn't exist in this region. Check the console.",
+                "ThrottlingException": "Still throttled after retries. Wait a minute and run again.",
+                "ModelErrorException": "The model kept producing a malformed response (e.g. a broken tool call).",
+            }
+            sys.exit(f"\n{code}: {e.response['Error']['Message']}\nHint: {hints.get(code, 'See error above.')}")
     response.pop("ResponseMetadata", None)  # HTTP noise; hide it so the useful shape stands out
     return response
 
@@ -367,13 +382,34 @@ def strip_thinking(text: str) -> str:
     return text.strip()
 
 
+# Generation settings for the agent loop, in ONE place (evals fingerprint these too).
+INFERENCE_CONFIG = {"maxTokens": 2000, "temperature": 0}
+
+
+def model_extras() -> dict:
+    """Model-specific settings that Converse doesn't standardise.
+
+    Nova kept failing with 'Model produced invalid sequence as part of ToolUse'. AWS's Nova
+    tool-use troubleshooting guide says: use greedy decoding (temperature 0 AND topK 1) and
+    leave enough maxTokens. topK goes through additionalModelRequestFields, in Nova's own
+    format, so it must only be sent to Nova (other providers expect a different shape).
+    """
+    if "nova" in (MODEL_ID or "").lower():
+        return {"additionalModelRequestFields": {"inferenceConfig": {"topK": 1}}}
+    return {}
+
+
 def run_agent(client, question: str, max_turns: int = 6,
-              tools: dict = None, tool_config: dict = None, system: list = None) -> str:
+              tools: dict = None, tool_config: dict = None, system: list = None,
+              trace: list = None) -> str:
     # Step 5 refactor: the loop no longer cares WHICH tools it runs. Pass in any
     # set (fake, real, a customer's) and the same engine drives them. Defaults = Step 4.
     tools = tools or AGENT_TOOLS
     tool_config = tool_config or AGENT_TOOL_CONFIG
     system = system or AGENT_SYSTEM
+    # Step 6 (evals): pass a list as `trace` and the loop records what it did, so tests
+    # can check HOW the agent got its answer (which tools, which inputs), not just the answer.
+    trace = trace if trace is not None else []
 
     messages = [{"role": "user", "content": [{"text": question}]}]
     total_in = total_out = 0
@@ -384,7 +420,8 @@ def run_agent(client, question: str, max_turns: int = 6,
             system=system,
             messages=messages,
             toolConfig=tool_config,
-            inferenceConfig={"maxTokens": 800, "temperature": 0},
+            inferenceConfig=INFERENCE_CONFIG,
+            **model_extras(),
         )
         stop = response["stopReason"]
         usage = response["usage"]
@@ -401,6 +438,7 @@ def run_agent(client, question: str, max_turns: int = 6,
                 if "toolUse" in block:
                     tool_use = block["toolUse"]
                     result = safe_run_tool(tool_use, tools)
+                    trace.append({"type": "tool", "name": tool_use["name"], "input": tool_use["input"], "result": result})
                     print(f"    tool: {tool_use['name']}({tool_use['input']}) -> {result}")
                     tool_results.append(
                         {"toolResult": {"toolUseId": tool_use["toolUseId"], "content": [{"json": result}]}}
@@ -415,9 +453,11 @@ def run_agent(client, question: str, max_turns: int = 6,
         elif stop != "end_turn":
             text += f"\n\n[WARNING: unexpected stopReason '{stop}']"
         print(f"\nTotals: {turn} turns, {total_in} input tokens, {total_out} output tokens")
+        trace.append({"type": "usage", "turns": turn, "input_tokens": total_in, "output_tokens": total_out, "stop": stop})
         return strip_thinking(text)
 
     print(f"\nTotals: hit max_turns={max_turns}, {total_in} input tokens, {total_out} output tokens")
+    trace.append({"type": "usage", "turns": max_turns, "input_tokens": total_in, "output_tokens": total_out, "stop": "max_turns"})
     return "[Agent stopped: hit max_turns without finishing. Check the tool descriptions or the prompt.]"
 
 
