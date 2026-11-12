@@ -334,7 +334,7 @@ def config_id():
     Covers model, prompt, tool menu, generation settings AND the code (via git). Without the
     code, a fix inside a tool function would score under the same id as the old version.
     """
-    blob = json.dumps({"model": al.MODEL_ID, "system": ct.cost_system_prompt()[0]["text"].split("Today's date")[0],
+    blob = json.dumps({"model": al.MODEL_ID, "system": ct.COST_PROMPT_TEMPLATE,
                        "tools": ct.COST_TOOL_CONFIG, "inference": al.INFERENCE_CONFIG,
                        "extras": al.model_extras(), "code": git_version()}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:8]

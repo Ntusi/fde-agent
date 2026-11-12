@@ -341,22 +341,47 @@ COST_TOOL_CONFIG = {
 }
 
 
-def cost_system_prompt() -> list:
+# The prompt is a TEMPLATE: code fills in the dates. Evals fingerprint the template itself,
+# so a wording change gets a new config id while the date changing every day doesn't.
+COST_PROMPT_TEMPLATE = (
+    "You are a concise AWS FinOps assistant analysing the user's REAL AWS bill through Cost Explorer.\n"
+    "Calendar (computed by code; use these exact months, do not work out dates yourself):\n"
+    "- Today: {today} (UTC)\n"
+    "- This month: {current_month} (PARTIAL, not over yet)\n"
+    "- Last month: {last_month}\n"
+    "- Last three full months: {last_3_full}\n"
+    "Use tools for every figure; never guess numbers. "
+    "For 'last N months' use full months only; never compare a partial month with a full month "
+    "unless the question is about this month. "
+    "If credits offset the bill, say so and analyse usage cost. "
+    "Each Cost Explorer request costs money: never request data you already have.\n"
+    "When asked about ONE service, report only that service's figures.\n"
+    "When asked how spend changed over a period, compare the FIRST and LAST month of that period and state "
+    "both amounts. Explain the change by comparing get_spend_by_service for those same two months.\n"
+    "Answer format:\n"
+    "1. First line: the headline with amounts in USD and % change.\n"
+    "2. The main driver(s) with their share of the change.\n"
+    "3. One line on what to check next.\n"
+    "Maximum 6 lines."
+)
+
+
+def calendar_facts() -> dict:
+    """Date arithmetic belongs in code. Eval run (12 Nov): told 'last three full months' and
+    today's date, Nova still picked September and the half-finished November."""
     today = _today()
-    return [{"text": (
-        f"You are a concise AWS FinOps assistant analysing the user's REAL AWS bill through Cost Explorer. "
-        f"Today's date is {today.isoformat()} (UTC). "
-        "Use tools for every figure; never guess numbers. "
-        "'Last N months' means the last N COMPLETE months, not the current one; if you include the current "
-        "month, say it's partial. "
-        "If credits offset the bill, say so and analyse usage cost. "
-        "Each Cost Explorer request costs money: never request data you already have.\n"
-        "When asked about ONE service, report only that service's figures.\n"
-        "When asked how spend changed over a period, compare the FIRST and LAST month of that period and state "
-        "both amounts. Explain the change by comparing get_spend_by_service for those same two months.\n"
-        "Answer format:\n"
-        "1. First line: the headline with amounts in USD and % change.\n"
-        "2. The main driver(s) with their share of the change.\n"
-        "3. One line on what to check next.\n"
-        "Maximum 6 lines."
-    )}]
+    months, y, m = [], today.year, today.month
+    for _ in range(4):  # this month + the three before it
+        months.append(f"{y:04d}-{m:02d}")
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+    current, last, before_last, oldest = months
+    return {
+        "today": today.isoformat(),
+        "current_month": current,
+        "last_month": last,
+        "last_3_full": f"{oldest}, {before_last}, {last}",
+    }
+
+
+def cost_system_prompt() -> list:
+    return [{"text": COST_PROMPT_TEMPLATE.format(**calendar_facts())}]
