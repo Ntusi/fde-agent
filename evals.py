@@ -408,13 +408,15 @@ def config_id():
 
 
 def previous_scores():
+    """Scores from the last run of the SAME engine and model. Comparing a Strands run with
+    the last Nova Pro run (which is what the first version did) is apples to oranges."""
     if not RESULTS_DIR.exists():
         return {}
-    files = sorted(RESULTS_DIR.glob("*.json"))
-    if not files:
-        return {}
-    data = json.loads(files[-1].read_text())
-    return {c["name"]: (c["passed"], c["total"]) for c in data["cases"]}
+    for f in sorted(RESULTS_DIR.glob("*.json"), reverse=True):
+        data = json.loads(f.read_text())
+        if data.get("model") == al.MODEL_ID and data.get("engine", "handbuilt") == ENGINE:
+            return {c["name"]: (c["passed"], c["total"]) for c in data["cases"]}
+    return {}
 
 
 def make_runner():
@@ -479,7 +481,7 @@ def run(filter_text=None):
         total_p += c["passed"]
         total_t += c["total"]
         prev = before.get(c["name"])
-        delta = f"   (last run {prev[0]}/{prev[1]})" if prev else ""
+        delta = f"   (last {ENGINE} run on this model: {prev[0]}/{prev[1]})" if prev else ""
         mark = "✅" if c["passed"] == c["total"] else "❌"
         print(f"{mark} {c['name']:<26} {c['passed']}/{c['total']}{delta}")
     tokens_in = sum(c["input_tokens"] or 0 for c in report["cases"])
