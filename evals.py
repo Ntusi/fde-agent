@@ -13,8 +13,9 @@ returned during that same run (recorded in the trace). So the tests stay valid a
 real bill changes: no hard-coded dollar amounts.
 
 Run:
-  python evals.py                 # all cases
-  python evals.py bedrock         # only cases whose name contains "bedrock"
+  python evals.py                     # all cases, hand-built agent (agent_loop.py)
+  python evals.py bedrock             # only cases whose name contains "bedrock"
+  python evals.py --engine strands    # same cases, Strands agent (strands_agent.py)
 
 Cost: a full run is roughly 10-20 Cost Explorer requests (~$0.10-0.20) plus a few
 cents of Bedrock. Results are saved in eval_results/ so you can compare runs.
@@ -391,6 +392,9 @@ def git_version():
         return "nogit"
 
 
+ENGINE = "handbuilt"  # or "strands"; set from the command line
+
+
 def config_id():
     """Fingerprint of everything that shapes behaviour, so you know WHAT each score was measured on.
 
@@ -399,7 +403,7 @@ def config_id():
     """
     blob = json.dumps({"model": al.MODEL_ID, "system": ct.COST_PROMPT_TEMPLATE,
                        "tools": ct.COST_TOOL_CONFIG, "inference": al.INFERENCE_CONFIG,
-                       "extras": al.model_extras(), "code": git_version()}, sort_keys=True)
+                       "extras": al.model_extras(), "code": git_version(), "engine": ENGINE}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:8]
 
 
@@ -413,13 +417,24 @@ def previous_scores():
     return {c["name"]: (c["passed"], c["total"]) for c in data["cases"]}
 
 
-def run(filter_text=None):
+def make_runner():
+    """Same question in, same (answer, trace) out, whichever engine runs the loop."""
+    if ENGINE == "strands":
+        import strands_agent as sa  # imported here so the hand-built path doesn't need Strands installed
+        return lambda question, trace: sa.run_strands(question, trace)
     client = al.get_client()
+    return lambda question, trace: al.run_agent(client, question, tools=ct.COST_TOOLS,
+                                                tool_config=ct.COST_TOOL_CONFIG,
+                                                system=ct.cost_system_prompt(), trace=trace)
+
+
+def run(filter_text=None):
+    run_case = make_runner()
     cases = [c for c in CASES if not filter_text or filter_text in c["name"]]
     if not cases:
         sys.exit(f"No case name contains '{filter_text}'. Cases: {[c['name'] for c in CASES]}")
     before = previous_scores()
-    report = {"when": dt.datetime.now().isoformat(timespec="seconds"), "model": al.MODEL_ID,
+    report = {"when": dt.datetime.now().isoformat(timespec="seconds"), "model": al.MODEL_ID, "engine": ENGINE,
               "code": git_version(), "config_id": config_id(), "cases": []}
 
     for case in cases:
@@ -428,8 +443,7 @@ def run(filter_text=None):
         ce_before = ct.CE_CALLS
         crashed = None
         try:
-            answer = al.run_agent(client, case["question"], tools=ct.COST_TOOLS,
-                                  tool_config=ct.COST_TOOL_CONFIG, system=ct.cost_system_prompt(), trace=trace)
+            answer = run_case(case["question"], trace)
         except (Exception, SystemExit) as e:
             # One broken case must not kill the whole suite. Record it as a failure and move on.
             crashed = " ".join(f"{type(e).__name__}: {e}".split())  # one line, readable in the report
@@ -459,7 +473,7 @@ def run(filter_text=None):
         })
 
     # ---- Summary ----
-    print(f"\n{'=' * 70}\nSUMMARY  model={al.MODEL_ID}  code={report['code']}  config={report['config_id']}\n{'=' * 70}")
+    print(f"\n{'=' * 70}\nSUMMARY  engine={ENGINE}  model={al.MODEL_ID}  code={report['code']}  config={report['config_id']}\n{'=' * 70}")
     total_p = total_t = 0
     for c in report["cases"]:
         total_p += c["passed"]
@@ -482,5 +496,12 @@ def run(filter_text=None):
 
 
 if __name__ == "__main__":
-    all_passed = run(sys.argv[1] if len(sys.argv) > 1 else None)
+    args = sys.argv[1:]
+    if "--engine" in args:
+        i = args.index("--engine")
+        ENGINE = args[i + 1]
+        del args[i:i + 2]
+        if ENGINE not in ("handbuilt", "strands"):
+            sys.exit("--engine must be handbuilt or strands")
+    all_passed = run(args[0] if args else None)
     sys.exit(0 if all_passed else 1)  # non-zero exit = a CI pipeline would block the change
