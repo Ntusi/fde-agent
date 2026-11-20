@@ -1,3 +1,17 @@
 .venv/
 __pycache__/
+*.py[cod]
 eval_results/
+
+# Never commit credentials or local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+credentials
+credentials.json
+
+# OS noise
+.DS_Store
