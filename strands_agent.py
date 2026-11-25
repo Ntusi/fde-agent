@@ -27,12 +27,15 @@ What it does NOT give you (you still own these):
 import json
 import os
 import sys
+import time
 
 from strands import Agent, tool
-from strands.hooks import AfterToolCallEvent, BeforeModelCallEvent, HookProvider, HookRegistry
+from strands.hooks import (AfterModelCallEvent, AfterToolCallEvent, BeforeModelCallEvent,
+                           BeforeToolCallEvent, HookProvider, HookRegistry)
 from strands.models import BedrockModel
 
 import cost_tools as ct
+import telemetry
 from agent_loop import INFERENCE_CONFIG, strip_thinking
 
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID")
@@ -116,6 +119,17 @@ class TurnLimit(HookProvider):
                             "Check the tool descriptions or the prompt.]")
 
 
+def parse_tool_result(tool_result) -> dict:
+    """Strands hands back a ToolResult; turn it back into the dict our tool returned."""
+    text = "".join(c.get("text", "") for c in tool_result.get("content", []))
+    if tool_result.get("status") == "error":
+        return {"error": text}  # Strands turned the exception into an error result
+    try:
+        return json.loads(text)  # Strands JSON-encodes dict returns as text
+    except ValueError:
+        return {"text": text}
+
+
 class TraceRecorder(HookProvider):
     """Records every tool call in the same shape agent_loop.run_agent uses, so evals.py
     can grade the Strands agent with exactly the same checks."""
@@ -127,18 +141,46 @@ class TraceRecorder(HookProvider):
         registry.add_callback(AfterToolCallEvent, self.after_tool_call)
 
     def after_tool_call(self, event: AfterToolCallEvent) -> None:
-        tool_result = event.result
-        text = "".join(c.get("text", "") for c in tool_result.get("content", []))
-        if tool_result.get("status") == "error":
-            result = {"error": text}  # Strands turned the exception into an error result
-        else:
-            try:
-                result = json.loads(text)  # Strands JSON-encodes dict returns as text
-            except ValueError:
-                result = {"text": text}
+        result = parse_tool_result(event.result)
         name = event.tool_use["name"]
         self.trace.append({"type": "tool", "name": name, "input": event.tool_use["input"], "result": result})
         print(f"    tool: {name}({event.tool_use['input']}) -> {result}")
+
+
+class TelemetryHook(HookProvider):
+    """Writes the same structured events as the hand-built loop (see telemetry.py),
+    from Strands' lifecycle hooks. This is how you observe a loop you don't own."""
+
+    def __init__(self, log: telemetry.RunLog):
+        self.log, self.turn, self._t_model, self._ce_before = log, 0, None, {}
+
+    def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
+        registry.add_callback(BeforeModelCallEvent, self.before_model)
+        registry.add_callback(AfterModelCallEvent, self.after_model)
+        registry.add_callback(BeforeToolCallEvent, self.before_tool)
+        registry.add_callback(AfterToolCallEvent, self.after_tool)
+
+    def before_model(self, event: BeforeModelCallEvent) -> None:
+        self.turn += 1
+        self._t_model = time.perf_counter()
+
+    def after_model(self, event: AfterModelCallEvent) -> None:
+        latency = (time.perf_counter() - self._t_model) * 1000 if self._t_model else 0
+        stop = event.stop_response.stop_reason if event.stop_response else f"exception: {event.exception}"
+        # Per-call token counts aren't exposed on this event; run totals are logged at run_end.
+        self.log.model_call(self.turn, latency, stop)
+
+    def before_tool(self, event: BeforeToolCallEvent) -> None:
+        self._ce_before[event.tool_use["toolUseId"]] = telemetry.ce_calls()
+
+    def after_tool(self, event: AfterToolCallEvent) -> None:
+        tool_use = event.tool_use
+        # If Strands runs several tools at once, these per-tool counts can overlap;
+        # the run total in run_end is always exact.
+        ce_requests = telemetry.ce_calls() - self._ce_before.pop(tool_use["toolUseId"], telemetry.ce_calls())
+        latency = event.duration * 1000 if event.duration is not None else None
+        self.log.tool_call(self.turn, tool_use["name"], tool_use["input"], parse_tool_result(event.result),
+                           latency, ce_requests)
 
 
 # ---------------------------------------------------------------------------
@@ -158,22 +200,27 @@ def build_model() -> BedrockModel:
     )
 
 
-def build_agent(trace: list, max_turns: int = MAX_TURNS) -> Agent:
+def build_agent(trace: list, max_turns: int = MAX_TURNS, log: telemetry.RunLog = None) -> Agent:
     """A fresh Agent per question. (An Agent object keeps its conversation between calls,
     which is what you want in a chat app and NOT what you want in an eval.)"""
     return Agent(
         model=build_model(),
         tools=TOOLS,
         system_prompt=ct.cost_system_prompt()[0]["text"],
-        hooks=[TurnLimit(max_turns), TraceRecorder(trace)],
+        hooks=[TurnLimit(max_turns), TraceRecorder(trace)] + ([TelemetryHook(log)] if log else []),
         callback_handler=None,  # silence token-by-token streaming; our hook prints the tool calls
     )
 
 
 def run_strands(question: str, trace: list = None, max_turns: int = MAX_TURNS) -> str:
     trace = trace if trace is not None else []
-    agent = build_agent(trace, max_turns)
-    result = agent(question)  # <- the whole loop from Steps 1-4, in one line
+    log = telemetry.RunLog(question, engine="strands", model=MODEL_ID)
+    agent = build_agent(trace, max_turns, log)
+    try:
+        result = agent(question)  # <- the whole loop from Steps 1-4, in one line
+    except BaseException as e:
+        log.end(status="error", error=" ".join(f"{type(e).__name__}: {e}".split()))
+        raise
 
     usage = result.metrics.accumulated_usage
     turns = result.metrics.cycle_count
@@ -185,7 +232,11 @@ def run_strands(question: str, trace: list = None, max_turns: int = MAX_TURNS) -
     text = str(result)
     if result.stop_reason == "max_tokens":
         text += "\n\n[WARNING: answer was cut off by maxTokens]"
-    return strip_thinking(text)
+    answer = strip_thinking(text)
+    log.end(answer=answer, turns=turns, input_tokens=usage.get("inputTokens", 0),
+            output_tokens=usage.get("outputTokens", 0),
+            status="ok" if result.stop_reason == "end_turn" else result.stop_reason)
+    return answer
 
 
 if __name__ == "__main__":

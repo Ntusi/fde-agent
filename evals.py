@@ -32,6 +32,9 @@ from pathlib import Path
 
 import agent_loop as al
 import cost_tools as ct
+import telemetry
+
+telemetry.RUN_TAG = "eval"  # so logs can separate test runs from real questions
 
 RESULTS_DIR = Path(__file__).with_name("eval_results")
 

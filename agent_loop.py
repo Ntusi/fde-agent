@@ -30,6 +30,8 @@ import os
 import sys
 import time
 
+import telemetry
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -402,19 +404,39 @@ def model_extras() -> dict:
 def run_agent(client, question: str, max_turns: int = 6,
               tools: dict = None, tool_config: dict = None, system: list = None,
               trace: list = None) -> str:
+    """Run one question through the agent loop, logging every step (Step 6: logging).
+
+    The wrapper owns the run's log: start, end, and the error if anything crashes,
+    so even a failed run leaves a record. The loop itself logs each model and tool call.
+    """
+    trace = trace if trace is not None else []
+    log = telemetry.RunLog(question, engine="handbuilt", model=MODEL_ID)
+    try:
+        answer = _run_loop(client, question, max_turns, tools, tool_config, system, trace, log)
+    except BaseException as e:  # includes the SystemExit call_converse raises on a hard error
+        log.end(status="error", error=" ".join(f"{type(e).__name__}: {e}".split()))
+        raise
+    usage = next((e for e in reversed(trace) if e["type"] == "usage"), {})
+    log.end(answer=answer, turns=usage.get("turns"), input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            status="ok" if usage.get("stop") == "end_turn" else usage.get("stop"))
+    return answer
+
+
+def _run_loop(client, question, max_turns, tools, tool_config, system, trace, log) -> str:
     # Step 5 refactor: the loop no longer cares WHICH tools it runs. Pass in any
     # set (fake, real, a customer's) and the same engine drives them. Defaults = Step 4.
     tools = tools or AGENT_TOOLS
     tool_config = tool_config or AGENT_TOOL_CONFIG
     system = system or AGENT_SYSTEM
-    # Step 6 (evals): pass a list as `trace` and the loop records what it did, so tests
-    # can check HOW the agent got its answer (which tools, which inputs), not just the answer.
-    trace = trace if trace is not None else []
+    # Step 6 (evals): `trace` records what the loop did, so tests can check HOW the agent
+    # got its answer (which tools, which inputs), not just the answer.
 
     messages = [{"role": "user", "content": [{"text": question}]}]
     total_in = total_out = 0
 
     for turn in range(1, max_turns + 1):  # GUARD: never loop forever
+        t_model = time.perf_counter()
         response = call_converse(
             client,
             system=system,
@@ -427,6 +449,8 @@ def run_agent(client, question: str, max_turns: int = 6,
         usage = response["usage"]
         total_in += usage["inputTokens"]
         total_out += usage["outputTokens"]
+        log.model_call(turn, (time.perf_counter() - t_model) * 1000, stop,
+                       usage["inputTokens"], usage["outputTokens"])
         print(f"\n--- Turn {turn}: stopReason={stop}  in={usage['inputTokens']} out={usage['outputTokens']}")
 
         assistant_message = response["output"]["message"]
@@ -437,7 +461,10 @@ def run_agent(client, question: str, max_turns: int = 6,
             for block in assistant_message["content"]:
                 if "toolUse" in block:
                     tool_use = block["toolUse"]
+                    t_tool, ce_before = time.perf_counter(), telemetry.ce_calls()
                     result = safe_run_tool(tool_use, tools)
+                    log.tool_call(turn, tool_use["name"], tool_use["input"], result,
+                                  (time.perf_counter() - t_tool) * 1000, telemetry.ce_calls() - ce_before)
                     trace.append({"type": "tool", "name": tool_use["name"], "input": tool_use["input"], "result": result})
                     print(f"    tool: {tool_use['name']}({tool_use['input']}) -> {result}")
                     tool_results.append(
